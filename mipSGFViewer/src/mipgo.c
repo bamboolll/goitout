@@ -511,7 +511,6 @@ static void analyze_node(SGFNode *node, const char *prefix) {
 		analyze_node(node->next, prefix);
 }
 
-
 int showscore = 0;
 
 /*
@@ -634,27 +633,22 @@ static void mip_ascii_showboard(void) {
 
 } /* end ascii_showboard */
 
-
 /*
  * Initialize the structure.
  */
 
-void
-gameinfo_clear(Gameinfo *gameinfo)
-{
-  gnugo_clear_board(board_size);
-  gameinfo->handicap = 0;
-  gameinfo->to_move = BLACK;
-  sgftree_clear(&gameinfo->game_record);
+void gameinfo_clear(Gameinfo *gameinfo) {
+	gnugo_clear_board(board_size);
+	gameinfo->handicap = 0;
+	gameinfo->to_move = BLACK;
+	sgftree_clear(&gameinfo->game_record);
 
-  /* Info relevant to the computer player. */
-  gameinfo->computer_player = WHITE; /* Make an assumption. */
+	/* Info relevant to the computer player. */
+	gameinfo->computer_player = WHITE; /* Make an assumption. */
 }
 
-
-void  process_sgf(char* infilename, char* number)
-{
-	printf("Processs SGF file %s \n",infilename);
+void process_sgf(char* infilename, char* number) {
+	printf("Processs SGF file %s \n", infilename);
 	Gameinfo gameinfo;
 	SGFTree sgftree;
 
@@ -662,25 +656,197 @@ void  process_sgf(char* infilename, char* number)
 	sgftree_clear(&sgftree);
 
 	if (!sgftree_readfile(&sgftree, infilename)) {
-	      fprintf(stderr, "Cannot open or parse '%s'\n", infilename);
-	      exit(EXIT_FAILURE);
-	    }
-
-	if (gameinfo_play_sgftree_rot(&gameinfo, &sgftree, number,
-				  0) == EMPTY) {
-	  fprintf(stderr, "Cannot load '%s'\n", infilename);
-	  exit(EXIT_FAILURE);
+		fprintf(stderr, "Cannot open or parse '%s'\n", infilename);
+		exit(EXIT_FAILURE);
+	}
+	/*
+	if (gameinfo_play_sgftree_rot(&gameinfo, &sgftree, number, 0) == EMPTY) {
+		fprintf(stderr, "Cannot load '%s'\n", infilename);
+		exit(EXIT_FAILURE);
 	}
 
-	mip_ascii_showboard();
+	mip_ascii_showboard();*/
+
+	sgfSimplePlayer(&gameinfo, &sgftree, number, 0);
+
 }
 
 
+int doNext(Gameinfo *gameinfo, SGFTree *tree)
+{
+	int orientation = 0;
+	int next;
+
+	int move;
+	SGFProperty *prop;
+	printf("\nNode property:");
+	for (prop = tree->lastnode->props; prop; prop = prop->next) {
+		//DEBUG(DEBUG_LOADSGF, "%c%c[%s]\n",
+		//  prop->name & 0xff, (prop->name >> 8), prop->value);
+		printf("%c%c[%s] - ",prop->name & 0xff, (prop->name >> 8), prop->value);
+		switch (prop->name) {
+		case SGFAB:
+		case SGFAW:
+			/* Generally the last move is unknown when the AB or AW
+			 * properties are encountered. These are used to set up
+			 * a board position (diagram) or to place handicap stones
+			 * without reference to the order in which the stones are
+			 * placed on the board.
+			 */
+			move = rotate1(get_sgfmove(prop), orientation);
+			if (board[move] != EMPTY)
+				gprintf(
+						"Illegal SGF! attempt to add a stone at occupied point %1m\n",
+						move);
+			else
+				add_stone(move, prop->name == SGFAB ? BLACK : WHITE);
+			break;
+
+		case SGFPL:
+			/* Due to a bad comment in the SGF FF3 definition (in the
+			 * "Alphabetical list of properties" section) some
+			 * applications encode the colors with 1 for black and 2 for
+			 * white.
+			 */
+			if (prop->value[0] == 'w' || prop->value[0] == 'W'
+					|| prop->value[0] == '2')
+				next = WHITE;
+			else
+				next = BLACK;
+			/* following really should not be needed for proper sgf file */
+			if (stones_on_board(GRAY) == 0 && next == WHITE) {
+				place_fixed_handicap(gameinfo->handicap);
+				sgfOverwritePropertyInt(tree->root, "HA", handicap);
+			}
+			break;
+
+		case SGFW:
+		case SGFB:
+			next = prop->name == SGFW ? WHITE : BLACK;
+			/* following really should not be needed for proper sgf file */
+			if (stones_on_board(GRAY) == 0 && next == WHITE) {
+				place_fixed_handicap(gameinfo->handicap);
+				sgfOverwritePropertyInt(tree->root, "HA", handicap);
+			}
+
+			move = get_sgfmove(prop);
+//				if (move == untilmove || movenum == until - 1) {
+//					gameinfo->to_move = next;
+//					/* go back so that variant will be added to the proper node */
+//					sgftreeBack(tree);
+//					return next;
+//				}
+
+			move = rotate1(move, orientation);
+			if (move == PASS_MOVE || board[move] == EMPTY) {
+				gnugo_play_move(move, next);
+				next = OTHER_COLOR(next);
+			} else {
+				gprintf(
+						"WARNING: Move off board or on occupied position found in sgf-file.\n");
+				gprintf("Move at %1m ignored, trying to proceed.\n", move);
+				gameinfo->to_move = next;
+				return next;
+			}
+
+			break;
+
+		case SGFIL:
+			/* The IL property is not a standard SGF property but
+			 * is used by GNU Go to mark illegal moves. If a move
+			 * is found marked with the IL property which is a ko
+			 * capture then that ko capture is deemed illegal and
+			 * (board_ko_i, board_ko_j) is set to the location of
+			 * the ko.
+			 */
+			move = rotate1(get_sgfmove(prop), orientation);
+
+			if (board_size > 1) {
+				int move_color;
+
+				if (ON_BOARD(NORTH(move)))
+					move_color = OTHER_COLOR(board[NORTH(move)]);
+				else
+					move_color = OTHER_COLOR(board[SOUTH(move)]);
+				if (is_ko(move, move_color, NULL ))
+					board_ko_pos = move;
+			}
+			break;
+		}
+	}
+	return 0;
+}
+
+int sgfSimplePlayer(Gameinfo *gameinfo, SGFTree *tree,
+		const char *untilstr, int orientation) {
+	int bs;
+	int next = BLACK;
+	int untilmove = -1; /* Neither a valid move nor pass. */
+	int until = 9999;
+	char line[80];
+	if (!sgfGetIntProperty(tree->root, "SZ", &bs))
+		bs = 19;
+
+	if (!check_boardsize(bs, stderr))
+		return EMPTY;
+
+	handicap = 0;
+	if (sgfGetIntProperty(tree->root, "HA", &handicap) && handicap > 1)
+		next = WHITE;
+	gameinfo->handicap = handicap;
+
+	if (handicap > bs * bs - 1 || handicap < 0) {
+		gprintf(" Handicap HA[%d] is unreasonable.\n Modify SGF file.\n",
+				handicap);
+		return EMPTY;
+	}
+
+	gnugo_clear_board(bs);
+
+	if (!sgfGetFloatProperty(tree->root, "KM", &komi)) {
+		if (gameinfo->handicap == 0)
+			komi = 5.5;
+		else
+			komi = 0.5;
+	}
+
+	/* Now we can safely parse the until string (which depends on board size). */
+	if (untilstr) {
+		if (*untilstr > '0' && *untilstr <= '9') {
+			until = atoi(untilstr);
+			//DEBUG(DEBUG_LOADSGF, "Loading until move %d\n", until);
+		} else {
+			untilmove = string_to_location(board_size, untilstr);
+			// DEBUG(DEBUG_LOADSGF, "Loading until move at %1m\n", untilmove);
+		}
+	}
+
+	/* Finally, we iterate over all the properties of all the
+	 * nodes, actioning them. We follow only the 'child' pointers,
+	 * as we have no interest in variations.
+	 *
+	 * The sgf routines map AB[aa][bb][cc] into AB[aa]AB[bb]AB[cc]
+	 */
+	for (tree->lastnode = NULL ; sgftreeForward(tree);) {
+		//show variation
+		//TODO
+		//get input
+		//TODO
+		fgets(line,80,stdin);
+		//playmove
+		//TODO
+		doNext(gameinfo,tree);
+		//show board
+		mip_ascii_showboard();
+	}
+
+	gameinfo->to_move = next;
+	return next;
+}
 
 int main(int argc, char *argv[]) {
 	const char *filename;
 	const char *number;
-
 
 	SGFNode *sgf;
 
@@ -718,74 +884,65 @@ int main(int argc, char *argv[]) {
 
 	/* Walk through the tree and make patterns. */
 	//analyze_node(sgf, prefix);
-
-	process_sgf(filename,number);
+	process_sgf(filename, number);
 
 	return 0;
 }
-
-
 
 /* Check whether we can accept a certain boardsize. Set out to NULL to
  * suppress informative messages. Return 1 for an acceptable
  * boardsize, 0 otherwise.
  */
-int check_boardsize(int boardsize, FILE *out)
-{
-  int max_board = MAX_BOARD;
-  //if (use_monte_carlo_genmove && max_board > 9)
-  //  max_board = 9;
+int check_boardsize(int boardsize, FILE *out) {
+	int max_board = MAX_BOARD;
+	//if (use_monte_carlo_genmove && max_board > 9)
+	//  max_board = 9;
 
-  if (boardsize < MIN_BOARD || boardsize > max_board) {
-    if (out) {
-      fprintf(out, "Unsupported board size: %d. ", boardsize);
-      if (boardsize < MIN_BOARD)
-	fprintf(out, "Min size is %d.\n", MIN_BOARD);
-      else {
-	fprintf(out, "Max size is %d", max_board);
-	if (max_board < MAX_BOARD)
-	  fprintf(out, " (%d without --monte-carlo)", MAX_BOARD);
-	fprintf(out, ".\n");
-      }
-      fprintf(out, "Try `gnugo --help' for more information.\n");
-    }
-    return 0;
-  }
+	if (boardsize < MIN_BOARD || boardsize > max_board) {
+		if (out) {
+			fprintf(out, "Unsupported board size: %d. ", boardsize);
+			if (boardsize < MIN_BOARD)
+				fprintf(out, "Min size is %d.\n", MIN_BOARD);
+			else {
+				fprintf(out, "Max size is %d", max_board);
+				if (max_board < MAX_BOARD)
+					fprintf(out, " (%d without --monte-carlo)", MAX_BOARD);
+				fprintf(out, ".\n");
+			}
+			fprintf(out, "Try `gnugo --help' for more information.\n");
+		}
+		return 0;
+	}
 
-  return 1;
+	return 1;
 }
 
 /*
  * Clear the board.
  */
-void
-gnugo_clear_board(int boardsize)
-{
-  board_size = boardsize;
-  clear_board();
+void gnugo_clear_board(int boardsize) {
+	board_size = boardsize;
+	clear_board();
 //  init_timers();
 #if 0
-  if (metamachine && oracle_exists)
-    oracle_clear_board(boardsize);
+	if (metamachine && oracle_exists)
+	oracle_clear_board(boardsize);
 #endif
 }
 
 /* Play a move and start the clock */
 
-void
-gnugo_play_move(int move, int color)
-{
+void gnugo_play_move(int move, int color) {
 #if ORACLE
-  if (oracle_exists)
-    oracle_play_move(move, color);
-  else
-    play_move(move, color);
+	if (oracle_exists)
+	oracle_play_move(move, color);
+	else
+	play_move(move, color);
 #else
-  play_move(move, color);
+	play_move(move, color);
 #endif
 //  clock_push_button(color);
 }
-
 
 /*
  * Play the moves in an SGF tree. Walk the main variation, actioning
@@ -800,173 +957,165 @@ gnugo_play_move(int move, int color)
  * When debugging, this is the location of the move being examined.
  */
 
-int
-gameinfo_play_sgftree_rot(Gameinfo *gameinfo, SGFTree *tree,
-			  const char *untilstr, int orientation)
-{
-  int bs;
-  int next = BLACK;
-  int untilmove = -1; /* Neither a valid move nor pass. */
-  int until = 9999;
+int gameinfo_play_sgftree_rot(Gameinfo *gameinfo, SGFTree *tree,
+		const char *untilstr, int orientation) {
+	int bs;
+	int next = BLACK;
+	int untilmove = -1; /* Neither a valid move nor pass. */
+	int until = 9999;
 
-  if (!sgfGetIntProperty(tree->root, "SZ", &bs))
-    bs = 19;
+	if (!sgfGetIntProperty(tree->root, "SZ", &bs))
+		bs = 19;
 
-  if (!check_boardsize(bs, stderr))
-    return EMPTY;
+	if (!check_boardsize(bs, stderr))
+		return EMPTY;
 
-  handicap = 0;
-  if (sgfGetIntProperty(tree->root, "HA", &handicap) && handicap > 1)
-    next = WHITE;
-  gameinfo->handicap = handicap;
+	handicap = 0;
+	if (sgfGetIntProperty(tree->root, "HA", &handicap) && handicap > 1)
+		next = WHITE;
+	gameinfo->handicap = handicap;
 
-  if (handicap > bs * bs - 1 || handicap < 0) {
-    gprintf(" Handicap HA[%d] is unreasonable.\n Modify SGF file.\n",
-	    handicap);
-    return EMPTY;
-  }
+	if (handicap > bs * bs - 1 || handicap < 0) {
+		gprintf(" Handicap HA[%d] is unreasonable.\n Modify SGF file.\n",
+				handicap);
+		return EMPTY;
+	}
 
-  gnugo_clear_board(bs);
+	gnugo_clear_board(bs);
 
-  if (!sgfGetFloatProperty(tree->root, "KM", &komi)) {
-    if (gameinfo->handicap == 0)
-      komi = 5.5;
-    else
-      komi = 0.5;
-  }
+	if (!sgfGetFloatProperty(tree->root, "KM", &komi)) {
+		if (gameinfo->handicap == 0)
+			komi = 5.5;
+		else
+			komi = 0.5;
+	}
 
-  /* Now we can safely parse the until string (which depends on board size). */
-  if (untilstr) {
-    if (*untilstr > '0' && *untilstr <= '9') {
-      until = atoi(untilstr);
-      //DEBUG(DEBUG_LOADSGF, "Loading until move %d\n", until);
-    }
-    else {
-      untilmove = string_to_location(board_size, untilstr);
-     // DEBUG(DEBUG_LOADSGF, "Loading until move at %1m\n", untilmove);
-    }
-  }
+	/* Now we can safely parse the until string (which depends on board size). */
+	if (untilstr) {
+		if (*untilstr > '0' && *untilstr <= '9') {
+			until = atoi(untilstr);
+			//DEBUG(DEBUG_LOADSGF, "Loading until move %d\n", until);
+		} else {
+			untilmove = string_to_location(board_size, untilstr);
+			// DEBUG(DEBUG_LOADSGF, "Loading until move at %1m\n", untilmove);
+		}
+	}
 
-  /* Finally, we iterate over all the properties of all the
-   * nodes, actioning them. We follow only the 'child' pointers,
-   * as we have no interest in variations.
-   *
-   * The sgf routines map AB[aa][bb][cc] into AB[aa]AB[bb]AB[cc]
-   */
-  for (tree->lastnode = NULL; sgftreeForward(tree);) {
-    SGFProperty *prop;
-    int move;
-
-    for (prop = tree->lastnode->props; prop; prop = prop->next) {
-      //DEBUG(DEBUG_LOADSGF, "%c%c[%s]\n",
-	  //  prop->name & 0xff, (prop->name >> 8), prop->value);
-      switch (prop->name) {
-      case SGFAB:
-      case SGFAW:
-	/* Generally the last move is unknown when the AB or AW
-	 * properties are encountered. These are used to set up
-	 * a board position (diagram) or to place handicap stones
-	 * without reference to the order in which the stones are
-	 * placed on the board.
+	/* Finally, we iterate over all the properties of all the
+	 * nodes, actioning them. We follow only the 'child' pointers,
+	 * as we have no interest in variations.
+	 *
+	 * The sgf routines map AB[aa][bb][cc] into AB[aa]AB[bb]AB[cc]
 	 */
-	move = rotate1(get_sgfmove(prop), orientation);
-	if (board[move] != EMPTY)
-	  gprintf("Illegal SGF! attempt to add a stone at occupied point %1m\n",
-		  move);
-	else
-	  add_stone(move, prop->name == SGFAB ? BLACK : WHITE);
-	break;
+	for (tree->lastnode = NULL ; sgftreeForward(tree);) {
+		SGFProperty *prop;
+		int move;
 
-      case SGFPL:
-	/* Due to a bad comment in the SGF FF3 definition (in the
-         * "Alphabetical list of properties" section) some
-         * applications encode the colors with 1 for black and 2 for
-         * white.
-	 */
-	if (prop->value[0] == 'w'
-	    || prop->value[0] == 'W'
-	    || prop->value[0] == '2')
-	  next = WHITE;
-	else
-	  next = BLACK;
-	/* following really should not be needed for proper sgf file */
-	if (stones_on_board(GRAY) == 0 && next == WHITE) {
-	  place_fixed_handicap(gameinfo->handicap);
-	  sgfOverwritePropertyInt(tree->root, "HA", handicap);
+		for (prop = tree->lastnode->props; prop; prop = prop->next) {
+			//DEBUG(DEBUG_LOADSGF, "%c%c[%s]\n",
+			//  prop->name & 0xff, (prop->name >> 8), prop->value);
+			switch (prop->name) {
+			case SGFAB:
+			case SGFAW:
+				/* Generally the last move is unknown when the AB or AW
+				 * properties are encountered. These are used to set up
+				 * a board position (diagram) or to place handicap stones
+				 * without reference to the order in which the stones are
+				 * placed on the board.
+				 */
+				move = rotate1(get_sgfmove(prop), orientation);
+				if (board[move] != EMPTY)
+					gprintf(
+							"Illegal SGF! attempt to add a stone at occupied point %1m\n",
+							move);
+				else
+					add_stone(move, prop->name == SGFAB ? BLACK : WHITE);
+				break;
+
+			case SGFPL:
+				/* Due to a bad comment in the SGF FF3 definition (in the
+				 * "Alphabetical list of properties" section) some
+				 * applications encode the colors with 1 for black and 2 for
+				 * white.
+				 */
+				if (prop->value[0] == 'w' || prop->value[0] == 'W'
+						|| prop->value[0] == '2')
+					next = WHITE;
+				else
+					next = BLACK;
+				/* following really should not be needed for proper sgf file */
+				if (stones_on_board(GRAY) == 0 && next == WHITE) {
+					place_fixed_handicap(gameinfo->handicap);
+					sgfOverwritePropertyInt(tree->root, "HA", handicap);
+				}
+				break;
+
+			case SGFW:
+			case SGFB:
+				next = prop->name == SGFW ? WHITE : BLACK;
+				/* following really should not be needed for proper sgf file */
+				if (stones_on_board(GRAY) == 0 && next == WHITE) {
+					place_fixed_handicap(gameinfo->handicap);
+					sgfOverwritePropertyInt(tree->root, "HA", handicap);
+				}
+
+				move = get_sgfmove(prop);
+				if (move == untilmove || movenum == until - 1) {
+					gameinfo->to_move = next;
+					/* go back so that variant will be added to the proper node */
+					sgftreeBack(tree);
+					return next;
+				}
+
+				move = rotate1(move, orientation);
+				if (move == PASS_MOVE || board[move] == EMPTY) {
+					gnugo_play_move(move, next);
+					next = OTHER_COLOR(next);
+				} else {
+					gprintf(
+							"WARNING: Move off board or on occupied position found in sgf-file.\n");
+					gprintf("Move at %1m ignored, trying to proceed.\n", move);
+					gameinfo->to_move = next;
+					return next;
+				}
+
+				break;
+
+			case SGFIL:
+				/* The IL property is not a standard SGF property but
+				 * is used by GNU Go to mark illegal moves. If a move
+				 * is found marked with the IL property which is a ko
+				 * capture then that ko capture is deemed illegal and
+				 * (board_ko_i, board_ko_j) is set to the location of
+				 * the ko.
+				 */
+				move = rotate1(get_sgfmove(prop), orientation);
+
+				if (board_size > 1) {
+					int move_color;
+
+					if (ON_BOARD(NORTH(move)))
+						move_color = OTHER_COLOR(board[NORTH(move)]);
+					else
+						move_color = OTHER_COLOR(board[SOUTH(move)]);
+					if (is_ko(move, move_color, NULL ))
+						board_ko_pos = move;
+				}
+				break;
+			}
+		}
 	}
-	break;
 
-      case SGFW:
-      case SGFB:
-	next = prop->name == SGFW ? WHITE : BLACK;
-	/* following really should not be needed for proper sgf file */
-	if (stones_on_board(GRAY) == 0 && next == WHITE) {
-	  place_fixed_handicap(gameinfo->handicap);
-	  sgfOverwritePropertyInt(tree->root, "HA", handicap);
-	}
-
-	move = get_sgfmove(prop);
-	if (move == untilmove || movenum == until - 1) {
-	  gameinfo->to_move = next;
-	  /* go back so that variant will be added to the proper node */
-	  sgftreeBack(tree);
-	  return next;
-	}
-
-	move = rotate1(move, orientation);
-	if (move == PASS_MOVE || board[move] == EMPTY) {
-	  gnugo_play_move(move, next);
-	  next = OTHER_COLOR(next);
-	}
-	else {
-	  gprintf("WARNING: Move off board or on occupied position found in sgf-file.\n");
-	  gprintf("Move at %1m ignored, trying to proceed.\n", move);
-	  gameinfo->to_move = next;
-	  return next;
-	}
-
-	break;
-
-      case SGFIL:
-	/* The IL property is not a standard SGF property but
-	 * is used by GNU Go to mark illegal moves. If a move
-	 * is found marked with the IL property which is a ko
-	 * capture then that ko capture is deemed illegal and
-	 * (board_ko_i, board_ko_j) is set to the location of
-	 * the ko.
-	 */
-	move = rotate1(get_sgfmove(prop), orientation);
-
-	if (board_size > 1)
-	{
-	  int move_color;
-
-	  if (ON_BOARD(NORTH(move)))
-	    move_color = OTHER_COLOR(board[NORTH(move)]);
-	  else
-	    move_color = OTHER_COLOR(board[SOUTH(move)]);
-	  if (is_ko(move, move_color, NULL))
-	    board_ko_pos = move;
-	}
-	break;
-      }
-    }
-  }
-
-  gameinfo->to_move = next;
-  return next;
+	gameinfo->to_move = next;
+	return next;
 }
 
 /* Same as previous function, using standard orientation */
 
-int
-gameinfo_play_sgftree(Gameinfo *gameinfo, SGFTree *tree, const char *untilstr)
-{
-  return gameinfo_play_sgftree_rot(gameinfo, tree, untilstr, 0);
+int gameinfo_play_sgftree(Gameinfo *gameinfo, SGFTree *tree,
+		const char *untilstr) {
+	return gameinfo_play_sgftree_rot(gameinfo, tree, untilstr, 0);
 }
-
-
-
 
 /*
  * Local Variables:
